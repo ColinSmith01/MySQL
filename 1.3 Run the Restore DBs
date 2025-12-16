@@ -1,0 +1,15 @@
+
+# Standard run (files in F:\Dumps):
+& "C:\Temp\New\Restore-MySqlDumps.ps1" -LoginPath restore -DumpDir 'F:\Dumps'
+
+# If your dumps are in subfolders under F:\Dumps:
+& "C:\Temp\New\Restore-MySqlDumps.ps1" -LoginPath restore -DumpDir 'F:\Dumps' -Recurse
+
+
+##Sanity Checks
+
+# Confirm login path works
+mysql --login-path=restore -e "SELECT USER(), @@hostname, @@port;"
+
+# List restored databases
+mysql --login-path=restore -e "SHOW DATABASES;"
