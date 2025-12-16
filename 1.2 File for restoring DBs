@@ -1,0 +1,143 @@
+
+param(
+    [string]$DumpDir = "F:\Dumps",      # Folder containing dumps
+    [switch]$Recurse = $false,          # Set -Recurse if files are in subfolders
+
+    # Login path (created via mysql_config_editor; e.g., "restore")
+    [string]$LoginPath = "restore",
+
+    # Tools
+    [string]$MySqlExe = "mysql",
+    [string]$SevenZipExe = "C:\Program Files\7-Zip\7z.exe", # For .sql.gz streaming
+
+    # Defaults
+    [string]$DefaultCharset = "utf8mb4",
+    [string]$Collation = "utf8mb4_0900_ai_ci",
+
+    # Logging
+    [string]$LogFile = "F:\Dumps\restore.log",
+
+    # Drop & recreate schema before import
+    [switch]$DropAndRecreate = $true
+)
+
+function TS { Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
+function Write-Log([string]$msg, [string]$level="INFO") {
+    $line = "[{0}] [{1}] {2}" -f (TS), $level.ToUpper(), $msg
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+# Derive DB name from file name:
+# - Accepts "Backup-<name>-<date...>" and "<name>-<date...>"
+# - Stops at the first token that starts with a digit; uses up to 4 tokens
+# - ALWAYS skips/ignores a leading token "aurora" (case-insensitive)
+# - KEEPS HYPHENS in the final DB name (e.g., rocs-datalink), suitable for backtick-quoted SQL
+function Get-DbNameFromFile([string]$fileName) {
+    # Strip known extensions in order of specificity
+    $base = $fileName
+    if ($base.EndsWith(".sql.gz"))       { $base = $base.Substring(0, $base.Length - 7) }
+    elseif ($base.EndsWith(".sql.sql"))  { $base = $base.Substring(0, $base.Length - 8) }
+    elseif ($base.EndsWith(".sql"))      { $base = $base.Substring(0, $base.Length - 4) }
+
+    # Optional "Backup-" prefix
+    if ($base.StartsWith("Backup-", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $base = $base.Substring(7)
+    }
+
+    # Tokens until first date-like token (starts with a digit)
+    $tokens = $base.Split('-') | Where-Object { $_ -ne "" }
+
+    $nameTokens = @()
+    foreach ($t in $tokens) {
+        if ($t -match '^\d') { break }
+        # Skip an initial 'aurora' token
+        if ($nameTokens.Count -eq 0 -and $t -match '^(?i)aurora$') { continue }
+        $nameTokens += $t
+        if ($nameTokens.Count -ge 4) { break }
+    }
+
+    if ($nameTokens.Count -eq 0) {
+        throw "Could not derive database name from '$fileName'."
+    }
+
+    # IMPORTANT: keep hyphens (NOT underscores)
+    return ($nameTokens -join '-')
+}
+
+# --- Setup ---
+if (-not (Test-Path -Path $DumpDir)) { throw "DumpDir not found: $DumpDir" }
+New-Item -ItemType File -Path $LogFile -Force | Out-Null
+
+# Build a fully-quoted mysql base command that uses the login path
+$mysqlBaseQuoted = '"' + $MySqlExe + '"' +
+                   ' --login-path="' + $LoginPath + '"' +
+                   ' --default-character-set="' + $DefaultCharset + '"'
+
+# Use wildcard in -Path with -Include (so it works without -Recurse)
+$gciParams = @{ Path = (Join-Path $DumpDir '*'); File = $true }
+if ($Recurse) { $gciParams.Recurse = $true }
+
+# Collect supported dump files
+$files = Get-ChildItem @gciParams -Include *.sql, *.sql.gz, *.sql.sql | Sort-Object FullName
+
+if ($files.Count -eq 0) {
+    Write-Log "No dump files found in $DumpDir (Recurse=$Recurse). Looking for: *.sql, *.sql.gz, *.sql.sql" "WARN"
+    # Show directory contents for debugging
+    $present = Get-ChildItem -Path $DumpDir -Force
+    Write-Log ("Contents of {0}: {1}" -f $DumpDir, (($present | Select-Object -ExpandProperty Name) -join ', ')) "INFO"
+    exit 0
+}
+
+Write-Log "Found $($files.Count) dump files in $DumpDir (Recurse=$Recurse):"
+$files | ForEach-Object { Write-Log " - $($_.FullName)" }
+
+# Literal backtick for quoting DB names in SQL
+$bt = [char]96  # `
+
+foreach ($f in $files) {
+    try {
+        $isGzip = $f.Name.EndsWith(".sql.gz")
+        $dbName = Get-DbNameFromFile $f.Name
+        $dbNameBT = "$bt$dbName$bt"  # backtick-quoted DB name for SQL statements
+        $initCmd = 'SET FOREIGN_KEY_CHECKS=0;'
+
+        Write-Log "=== Restoring database '$dbName' from '$($f.FullName)' ==="
+
+        # Drop & recreate schema (use backticks in SQL because of hyphens)
+        if ($DropAndRecreate) {
+            $ddl = "DROP DATABASE IF EXISTS $dbNameBT; CREATE DATABASE $dbNameBT CHARACTER SET $DefaultCharset COLLATE $Collation;"
+            $cmdDDL = $mysqlBaseQuoted + ' -e "' + $ddl + '"'
+            cmd.exe /c "$cmdDDL" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "Pre-create failed for $dbName (ExitCode=$LASTEXITCODE)" "ERROR"
+                throw "Pre-create failed for $dbName"
+            }
+            Write-Log "Database '$dbName' dropped & created."
+        }
+
+        # Import: --database can safely take a hyphenated name when passed as a quoted value
+        if ($isGzip) {
+            if (-not (Test-Path $SevenZipExe)) {
+                throw "7-Zip not found at '$SevenZipExe'. Install 7-Zip or set -SevenZipExe."
+            }
+            $cmdImport = '"' + $SevenZipExe + '" e -so "' + $f.FullName + '" | ' +
+                         $mysqlBaseQuoted + ' --database "' + $dbName + '" --init-command="' + $initCmd + '"'
+        } else {
+            $cmdImport = $mysqlBaseQuoted + ' --database "' + $dbName + '" --init-command="' + $initCmd + '" < "' + $f.FullName + '"'
+        }
+
+        cmd.exe /c "$cmdImport" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "Import failed for $dbName (ExitCode=$LASTEXITCODE)" "ERROR"
+            throw "Import failed for $dbName"
+        }
+
+        Write-Log "[OK] '$dbName' restored."
+    }
+       catch {
+        Write-Log $_.Exception.Message "ERROR"
+        throw
+    }
+}
+
